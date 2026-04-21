@@ -1,0 +1,10 @@
+services:
+  ingest:
+    build: .
+    env_file:
+      - .env
+    volumes:
+      - ./.cache:/app/.cache
+      - ./gcp-key.json:/app/gcp-key.json:ro
+    environment:
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-key.json
