@@ -1,3 +1,6 @@
+<!-- chmod +x start.sh
+./start.sh -->
+
 # Spotify Analytics Tool — Restore Commands
 
 ## 1. Clone the repo

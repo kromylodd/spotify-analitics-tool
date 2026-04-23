@@ -15,7 +15,7 @@ log = logging.getLogger(__name__)
 CLIENT_ID = os.environ["SPOTIFY_CLIENT_ID"]
 CLIENT_SECRET = os.environ["SPOTIFY_CLIENT_SECRET"]
 REFRESH_TOKEN = os.environ["SPOTIFY_REFRESH_TOKEN"]
-BUCKET_NAME = os.environ["GCS_BUCKET"]
+GCS_BUCKET = os.environ["GCS_BUCKET"]
 LAST_TS_BLOB = "state/last_played_at.txt"  # stores cursor between runs
 
 

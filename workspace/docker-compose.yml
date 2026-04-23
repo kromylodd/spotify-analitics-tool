@@ -1,10 +1,68 @@
+version: "3.8"
+
 services:
-  ingest:
-    build: .
-    env_file:
-      - .env
+  kestra:
+    image: kestra/kestra:latest
+    user: root
+    pull_policy: always
+    entrypoint: /bin/bash
     volumes:
-      - ./.cache:/app/.cache
-      - ./gcp-key.json:/app/gcp-key.json:ro
+      - kestra-data:/app/storage
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/kestra-wd:/tmp/kestra-wd
+      - ./kestra-config.yml:/app/confs/application.yml
+    command: -c "exec /app/kestra server standalone --worker-thread=128"
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env.kestra
     environment:
-      - GOOGLE_APPLICATION_CREDENTIALS=/app/gcp-key.json
+      KESTRA_CONFIGURATION: |
+        datasources:
+          postgres:
+            url: jdbc:postgresql://postgres:5432/kestra
+            driverClassName: org.postgresql.Driver
+            username: kestra
+            password: kestra
+        kestra:
+          server:
+            basicAuth:
+              enabled: true
+              username: admin
+              password: admin
+          repository:
+            type: postgres
+          storage:
+            type: local
+            local:
+              basePath: /app/storage
+          queue:
+            type: postgres
+          tasks:
+            tmpDir:
+              path: /tmp/kestra-wd/tmp
+          scripting:
+            runner: PROCESS
+          url: http://localhost:8080/
+
+  postgres:
+    image: postgres:15
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_DB: kestra
+      POSTGRES_USER: kestra
+      POSTGRES_PASSWORD: kestra
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kestra"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  kestra-data:
+  postgres-data:

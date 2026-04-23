@@ -18,9 +18,6 @@ tasks:
 
   - id: ingest
     type: io.kestra.plugin.scripts.python.Script
-    description: "Refresh Spotify token, fetch tracks, write raw JSON to GCS"
-    docker:
-      image: python:3.11-slim
     beforeCommands:
       - pip install requests google-cloud-storage --quiet
     env:
@@ -28,8 +25,7 @@ tasks:
       SPOTIFY_CLIENT_SECRET: "{{ secret('SPOTIFY_CLIENT_SECRET') }}"
       SPOTIFY_REFRESH_TOKEN: "{{ secret('SPOTIFY_REFRESH_TOKEN') }}"
       GCS_BUCKET: "{{ secret('GCS_BUCKET') }}"
-    outputFiles:
-      - "*.json"
+      GOOGLE_APPLICATION_CREDENTIALS: /tmp/gcp-key.json
     script: |
       import os, json, base64, logging, requests
       from datetime import datetime, timezone
@@ -78,6 +74,10 @@ tasks:
           return path
 
       # --- main ---
+      import base64, os
+      gcp_key_b64 = os.environ["GCP_KEY_BASE64"]
+      gcp_key_b64 += "=" * (4 - len(gcp_key_b64) % 4)
+      open("/tmp/gcp-key.json", "w").write(base64.b64decode(gcp_key_b64).decode("utf-8"))
       gcs = storage.Client()
       bucket = gcs.bucket(BUCKET_NAME)
       token = get_access_token()
