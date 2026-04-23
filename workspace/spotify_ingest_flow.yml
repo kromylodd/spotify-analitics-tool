@@ -1,0 +1,147 @@
+id: spotify_ingest
+namespace: spotify.pipeline
+description: "Hourly ingestion of Spotify recently-played and top tracks to GCS"
+
+# ---------------------------------------------------------------------------
+# Inputs (optional — override at trigger time for backfills)
+# ---------------------------------------------------------------------------
+inputs:
+  - id: force_full_fetch
+    type: BOOLEAN
+    defaults: false
+    description: "Set true to ignore cursor and fetch full 50-track window"
+
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
+tasks:
+
+  - id: ingest
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Refresh Spotify token, fetch tracks, write raw JSON to GCS"
+    docker:
+      image: python:3.11-slim
+    beforeCommands:
+      - pip install requests google-cloud-storage --quiet
+    env:
+      SPOTIFY_CLIENT_ID: "{{ secret('SPOTIFY_CLIENT_ID') }}"
+      SPOTIFY_CLIENT_SECRET: "{{ secret('SPOTIFY_CLIENT_SECRET') }}"
+      SPOTIFY_REFRESH_TOKEN: "{{ secret('SPOTIFY_REFRESH_TOKEN') }}"
+      GCS_BUCKET: "{{ secret('GCS_BUCKET') }}"
+    outputFiles:
+      - "*.json"
+    script: |
+      import os, json, base64, logging, requests
+      from datetime import datetime, timezone
+      from google.cloud import storage
+
+      logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+      log = logging.getLogger(__name__)
+
+      CLIENT_ID     = os.environ["SPOTIFY_CLIENT_ID"]
+      CLIENT_SECRET = os.environ["SPOTIFY_CLIENT_SECRET"]
+      REFRESH_TOKEN = os.environ["SPOTIFY_REFRESH_TOKEN"]
+      BUCKET_NAME   = os.environ["GCS_BUCKET"]
+      LAST_TS_BLOB  = "state/last_played_at.txt"
+      FORCE_FULL    = "{{ inputs.force_full_fetch }}" == "true"
+
+      def get_access_token():
+          creds = base64.b64encode(f"{CLIENT_ID}:{CLIENT_SECRET}".encode()).decode()
+          r = requests.post(
+              "https://accounts.spotify.com/api/token",
+              headers={"Authorization": f"Basic {creds}"},
+              data={"grant_type": "refresh_token", "refresh_token": REFRESH_TOKEN},
+              timeout=10,
+          )
+          r.raise_for_status()
+          return r.json()["access_token"]
+
+      def read_cursor(bucket):
+          if FORCE_FULL:
+              return None
+          blob = bucket.blob(LAST_TS_BLOB)
+          return int(blob.download_as_text().strip()) if blob.exists() else None
+
+      def write_cursor(bucket, ts_ms):
+          bucket.blob(LAST_TS_BLOB).upload_from_string(str(ts_ms))
+
+      def fetch(url, token, params=None):
+          r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, params=params, timeout=10)
+          r.raise_for_status()
+          return r.json()
+
+      def to_gcs(bucket, data, prefix):
+          now = datetime.now(timezone.utc)
+          path = f"raw/{prefix}/{now:%Y/%m/%d}/{now:%H_%M_%S}.json"
+          bucket.blob(path).upload_from_string(json.dumps(data), content_type="application/json")
+          log.info(f"Written: gs://{BUCKET_NAME}/{path}")
+          return path
+
+      # --- main ---
+      gcs = storage.Client()
+      bucket = gcs.bucket(BUCKET_NAME)
+      token = get_access_token()
+
+      # Recently played (incremental)
+      cursor = read_cursor(bucket)
+      params = {"limit": 50}
+      if cursor:
+          params["after"] = cursor
+
+      recent = fetch("https://api.spotify.com/v1/me/recently-played", token, params)
+      items  = recent.get("items", [])
+      recent_path = None
+
+      if items:
+          recent_path = to_gcs(bucket, recent, "recently_played")
+          latest_ms = max(
+              int(datetime.fromisoformat(i["played_at"].replace("Z", "+00:00")).timestamp() * 1000)
+              for i in items
+          )
+          write_cursor(bucket, latest_ms)
+          log.info(f"Ingested {len(items)} new tracks")
+      else:
+          log.info("No new tracks since last run")
+
+      # Top tracks (full snapshot)
+      top = fetch(
+          "https://api.spotify.com/v1/me/top/tracks", token,
+          {"limit": 50, "time_range": "short_term"}
+      )
+      top_path = to_gcs(bucket, top, "top_tracks")
+
+      # Output for downstream tasks
+      result = {
+          "recently_played_path": recent_path,
+          "top_tracks_path": top_path,
+          "tracks_ingested": len(items),
+          "run_ts": datetime.now(timezone.utc).isoformat(),
+      }
+      print(f"::{json.dumps({'outputs': result})}")
+
+  # Optional: log run summary to Slack or just keep for now as a no-op
+  - id: log_summary
+    type: io.kestra.plugin.core.log.Log
+    message: |
+      Run complete.
+      Recently played path: {{ outputs.ingest.vars.recently_played_path }}
+      Top tracks path:      {{ outputs.ingest.vars.top_tracks_path }}
+      Tracks ingested:      {{ outputs.ingest.vars.tracks_ingested }}
+
+# ---------------------------------------------------------------------------
+# Error handling
+# ---------------------------------------------------------------------------
+errors:
+  - id: notify_failure
+    type: io.kestra.plugin.core.log.Log
+    message: "spotify_ingest FAILED at {{ execution.startDate }} — check logs"
+
+# ---------------------------------------------------------------------------
+# Schedule — hourly
+# ---------------------------------------------------------------------------
+triggers:
+  - id: hourly_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 * * * *"
+    # Uncomment to disable auto-backfill on missed runs:
+    # backfill: false
