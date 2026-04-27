@@ -18,8 +18,6 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    env_file:
-      - .env.kestra
     environment:
       KESTRA_CONFIGURATION: |
         datasources:
@@ -45,8 +43,6 @@ services:
           tasks:
             tmpDir:
               path: /tmp/kestra-wd/tmp
-          scripting:
-            runner: PROCESS
           url: http://localhost:8080/
 
   postgres:

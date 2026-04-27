@@ -21,7 +21,5 @@ kestra:
   tasks:
     tmpDir:
       path: /tmp/kestra-wd/tmp
-  scripting:
-    runner: PROCESS
   url: http://localhost:8080/
 

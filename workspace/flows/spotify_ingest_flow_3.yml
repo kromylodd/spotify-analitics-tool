@@ -1,0 +1,266 @@
+id: spotify_ingest
+namespace: data-collect
+description: "Hourly ingestion of Spotify recently-played and top tracks to GCS, then BigQuery"
+
+inputs:
+  - id: force_full_fetch
+    type: BOOLEAN
+    defaults: false
+    description: "Set true to ignore cursor and fetch full 50-track window"
+
+tasks:
+
+  # ---------------------------------------------------------------------------
+  # 1. Ingest from Spotify API → GCS (raw JSON)
+  # ---------------------------------------------------------------------------
+  - id: ingest
+    type: io.kestra.plugin.scripts.python.Script
+    containerImage: python:3.11-slim
+    beforeCommands:
+      - pip install requests google-cloud-storage --quiet
+    env:
+      SPOTIFY_CLIENT_ID: "{{ kv('SPOTIFY_CLIENT_ID') }}"
+      SPOTIFY_CLIENT_SECRET: "{{ kv('SPOTIFY_CLIENT_SECRET') }}"
+      SPOTIFY_REFRESH_TOKEN: "{{ kv('SPOTIFY_REFRESH_TOKEN') }}"
+      GCS_BUCKET: "{{ kv('GCS_BUCKET') }}"
+      GCP_CREDS: "{{ kv('GCP_CREDS') }}"
+    script: |
+      import os, json, base64, logging, requests
+      from datetime import datetime, timezone
+      from google.cloud import storage
+      from google.oauth2 import service_account
+
+      logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+      log = logging.getLogger(__name__)
+
+      CLIENT_ID     = os.environ["SPOTIFY_CLIENT_ID"]
+      CLIENT_SECRET = os.environ["SPOTIFY_CLIENT_SECRET"]
+      REFRESH_TOKEN = os.environ["SPOTIFY_REFRESH_TOKEN"]
+      BUCKET_NAME   = os.environ["GCS_BUCKET"]
+      LAST_TS_BLOB  = "state/last_played_at.txt"
+      FORCE_FULL    = "{{ inputs.force_full_fetch }}" == "true"
+
+      gcp_creds_json = os.environ["GCP_CREDS"]
+      creds_info = json.loads(gcp_creds_json)
+      credentials = service_account.Credentials.from_service_account_info(
+          creds_info,
+          scopes=["https://www.googleapis.com/auth/cloud-platform"],
+      )
+      gcs = storage.Client(credentials=credentials, project=creds_info["project_id"])
+      bucket = gcs.bucket(BUCKET_NAME)
+
+      def get_access_token():
+          creds = base64.b64encode(f"{CLIENT_ID}:{CLIENT_SECRET}".encode()).decode()
+          r = requests.post(
+              "https://accounts.spotify.com/api/token",
+              headers={"Authorization": f"Basic {creds}"},
+              data={"grant_type": "refresh_token", "refresh_token": REFRESH_TOKEN},
+              timeout=10,
+          )
+          r.raise_for_status()
+          return r.json()["access_token"]
+
+      def read_cursor():
+          if FORCE_FULL:
+              return None
+          blob = bucket.blob(LAST_TS_BLOB)
+          return int(blob.download_as_text().strip()) if blob.exists() else None
+
+      def write_cursor(ts_ms):
+          bucket.blob(LAST_TS_BLOB).upload_from_string(str(ts_ms))
+
+      def fetch(url, token, params=None):
+          r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, params=params, timeout=10)
+          if r.status_code == 404:
+              log.warning(f"404 on {url} — skipping")
+              return {"items": []}
+          r.raise_for_status()
+          return r.json()
+
+      def to_gcs(data, prefix):
+          now = datetime.now(timezone.utc)
+          path = f"raw/{prefix}/{now:%Y/%m/%d}/{now:%H_%M_%S}.json"
+          bucket.blob(path).upload_from_string(
+              json.dumps(data, ensure_ascii=False),
+              content_type="application/json",
+          )
+          log.info(f"Written: gs://{BUCKET_NAME}/{path}")
+          return path
+
+      token = get_access_token()
+
+      # Recently played (incremental)
+      cursor = read_cursor()
+      params = {"limit": 50}
+      if cursor:
+          params["after"] = cursor
+
+      recent = fetch("https://api.spotify.com/v1/me/recently-played", token, params)
+      items  = recent.get("items", [])
+      recent_path = None
+
+      if items:
+          recent_path = to_gcs(recent, "recently_played")
+          latest_ms = max(
+              int(datetime.fromisoformat(i["played_at"].replace("Z", "+00:00")).timestamp() * 1000)
+              for i in items
+          )
+          write_cursor(latest_ms)
+          log.info(f"Ingested {len(items)} new tracks")
+      else:
+          log.info("No new tracks since last run")
+
+      # Top tracks (full snapshot)
+      top = fetch(
+          "https://api.spotify.com/v1/me/top/tracks", token,
+          {"limit": 50, "time_range": "short_term"},
+      )
+      top_path = to_gcs(top, "top_tracks")
+
+      result = {
+          "recently_played_path": recent_path,
+          "top_tracks_path": top_path,
+          "tracks_ingested": len(items),
+          "run_ts": datetime.now(timezone.utc).isoformat(),
+      }
+      print(f"::{json.dumps({'outputs': result})}")
+
+  # ---------------------------------------------------------------------------
+  # 2. Load top tracks raw JSON → BigQuery staging
+  # ---------------------------------------------------------------------------
+  - id: load_top_tracks_staging
+    type: io.kestra.plugin.gcp.bigquery.Query
+    sql: |
+      LOAD DATA OVERWRITE `spotify-data-collect.spotify_data_raw.top_tracks_staging`
+      (raw_json STRING)
+      FROM FILES (
+        format = 'CSV',
+        field_delimiter = '\u0001',
+        uris = ['gs://{{ kv("GCS_BUCKET") }}/raw/top_tracks/{{ execution.startDate | date("yyyy/MM/dd") }}/*.json']
+      );
+
+  # ---------------------------------------------------------------------------
+  # 3. Transform top tracks → analytics table (flattened, deduplicated by day)
+  # ---------------------------------------------------------------------------
+  - id: transform_top_tracks
+    type: io.kestra.plugin.gcp.bigquery.Query
+    sql: |
+      CREATE TABLE IF NOT EXISTS `spotify-data-collect.spotify_data_raw.top_tracks`
+      (
+        track_id          STRING,
+        track_name        STRING,
+        artist_names      STRING,
+        album_name        STRING,
+        popularity        INT64,
+        duration_ms       INT64,
+        explicit          BOOL,
+        snapshot_ts       TIMESTAMP
+      )
+      PARTITION BY DATE(snapshot_ts)
+      CLUSTER BY track_id;
+
+      MERGE `spotify-data-collect.spotify_data_raw.top_tracks` T
+      USING (
+        SELECT
+          JSON_VALUE(item, '$.id')          AS track_id,
+          JSON_VALUE(item, '$.name')        AS track_name,
+          ARRAY_TO_STRING(ARRAY(
+            SELECT JSON_VALUE(a, '$.name')
+            FROM UNNEST(JSON_QUERY_ARRAY(item, '$.artists')) AS a
+          ), ', ')                          AS artist_names,
+          JSON_VALUE(item, '$.album.name')  AS album_name,
+          CAST(JSON_VALUE(item, '$.popularity') AS INT64)   AS popularity,
+          CAST(JSON_VALUE(item, '$.duration_ms') AS INT64)  AS duration_ms,
+          CAST(JSON_VALUE(item, '$.explicit') AS BOOL)      AS explicit,
+          TIMESTAMP('{{ execution.startDate | date("yyyy-MM-dd HH:mm:ss") }}') AS snapshot_ts
+        FROM `spotify-data-collect.spotify_data_raw.top_tracks_staging`,
+        UNNEST(JSON_QUERY_ARRAY(raw_json, '$.items')) AS item
+      ) S
+      ON T.track_id = S.track_id AND DATE(T.snapshot_ts) = DATE(S.snapshot_ts)
+      WHEN NOT MATCHED THEN INSERT VALUES (
+        S.track_id, S.track_name, S.artist_names, S.album_name,
+        S.popularity, S.duration_ms, S.explicit, S.snapshot_ts
+      );
+
+  # ---------------------------------------------------------------------------
+  # 4. Load recently played staging (allowFailure until 404 is resolved)
+  # ---------------------------------------------------------------------------
+  - id: load_rp_staging
+    type: io.kestra.plugin.gcp.bigquery.Query
+    allowFailure: true
+    sql: |
+      LOAD DATA OVERWRITE `spotify-data-collect.spotify_data_raw.recently_played_staging`
+      (raw_json STRING)
+      FROM FILES (
+        format = 'CSV',
+        field_delimiter = '\u0001',
+        uris = ['gs://{{ kv("GCS_BUCKET") }}/raw/recently_played/{{ execution.startDate | date("yyyy/MM/dd") }}/*.json']
+      );
+
+  # ---------------------------------------------------------------------------
+  # 5. Transform recently played → analytics table (incremental append)
+  # ---------------------------------------------------------------------------
+  - id: transform_recently_played
+    type: io.kestra.plugin.gcp.bigquery.Query
+    allowFailure: true
+    sql: |
+      CREATE TABLE IF NOT EXISTS `spotify-data-collect.spotify_data_raw.recently_played`
+      (
+        played_at     TIMESTAMP,
+        track_id      STRING,
+        track_name    STRING,
+        artist_names  STRING,
+        album_name    STRING,
+        duration_ms   INT64,
+        explicit      BOOL,
+        popularity    INT64
+      )
+      PARTITION BY DATE(played_at)
+      CLUSTER BY track_id;
+
+      MERGE `spotify-data-collect.spotify_data_raw.recently_played` T
+      USING (
+        SELECT
+          TIMESTAMP(JSON_VALUE(item, '$.played_at'))          AS played_at,
+          JSON_VALUE(item, '$.track.id')                      AS track_id,
+          JSON_VALUE(item, '$.track.name')                    AS track_name,
+          ARRAY_TO_STRING(ARRAY(
+            SELECT JSON_VALUE(a, '$.name')
+            FROM UNNEST(JSON_QUERY_ARRAY(item, '$.track.artists')) AS a
+          ), ', ')                                            AS artist_names,
+          JSON_VALUE(item, '$.track.album.name')              AS album_name,
+          CAST(JSON_VALUE(item, '$.track.duration_ms') AS INT64)  AS duration_ms,
+          CAST(JSON_VALUE(item, '$.track.explicit') AS BOOL)      AS explicit,
+          CAST(JSON_VALUE(item, '$.track.popularity') AS INT64)   AS popularity
+        FROM `spotify-data-collect.spotify_data_raw.recently_played_staging`,
+        UNNEST(JSON_QUERY_ARRAY(raw_json, '$.items')) AS item
+      ) S
+      ON T.track_id = S.track_id AND T.played_at = S.played_at
+      WHEN NOT MATCHED THEN INSERT VALUES (
+        S.played_at, S.track_id, S.track_name, S.artist_names,
+        S.album_name, S.duration_ms, S.explicit, S.popularity
+      );
+
+  # ---------------------------------------------------------------------------
+  # 6. Log summary
+  # ---------------------------------------------------------------------------
+  - id: log_summary
+    type: io.kestra.plugin.core.log.Log
+    message: "Run complete."
+
+errors:
+  - id: notify_failure
+    type: io.kestra.plugin.core.log.Log
+    message: "spotify_ingest FAILED at {{ execution.startDate }} — check logs"
+
+triggers:
+  - id: hourly_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 * * * *"
+
+pluginDefaults:
+  - type: io.kestra.plugin.gcp
+    values:
+      serviceAccount: "{{ kv('GCP_CREDS') }}"
+      projectId: "spotify-data-collect"
+      location: "europe-central2"
